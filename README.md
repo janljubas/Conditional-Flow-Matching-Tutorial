@@ -1,35 +1,39 @@
 # Pytorch Conditional-Flow-Matching(CFM) Tutorial
+
 A simple tutorial of [Conditional Flow Matching Models](https://arxiv.org/abs/2210.02747) (CFMs, Y. Lipman et. al., 2022) using MNIST dataset.
 
-
 # Implementations
-* [Conditional Flow Matching](https://arxiv.org/abs/2210.02747)
-* [MeanFlow](https://arxiv.org/abs/2505.13447)
 
+- [Conditional Flow Matching](https://arxiv.org/abs/2210.02747)
+- [MeanFlow](https://arxiv.org/abs/2505.13447)
 
 # Prerequisites
+
 (1) Download Pytorch and etcs.
-* [Anaconda](https://www.anaconda.com/)
-* Python=3.11
-* [Pytorch](https://pytorch.org/)=2.5. with CUDA 12.4
+
+- [Anaconda](https://www.anaconda.com/)
+- Python=3.11
+- [Pytorch](https://pytorch.org/)=2.5. with CUDA 12.4
 
 (2) Install dependencies via following command
+
 ```
 sh install.sh
 ```
 
-# Expremental Results
-* Used a RTX-3090 GPU for all implementations.
-* trained on MNIST dataset for 200 epochs
+# Exprimental Results
 
-* ground-truth samples <br>
+- Used a RTX-3090 GPU for all implementations.
+- trained on MNIST dataset for 200 epochs
+- ground-truth samples   
 
-![ground_truth](./assets/ground_truth_images.png)
 
-* generated samples <br>
+ground_truth
 
-![generated](./assets/generated_images.png)
+- generated samples   
 
+
+generated
 
 # References
 
@@ -40,4 +44,3 @@ sh install.sh
 [3] [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747), Y. Lipman et. al., 2022
 
 [4] [Mean Flows for One-step Generative Modeling](https://arxiv.org/abs/2505.13447), Z. Geng et. al., 2025
-
