@@ -8,7 +8,8 @@ can be any architecture that maps (x, t) -> velocity of the same shape as x.
 This module provides:
   - VelocityNet        : abstract base class with shared CFM math helpers
   - ConvStackVelocityNet : the original dilated-conv backbone (formerly CFMModel)
-  - UNetVelocityNet     : a U-Net backbone with skip connections and sinusoidal time embedding
+  - UNetVelocityNet     : a U-Net backbone with skip connections, sinusoidal time
+                          embedding, optional self-attention, and class conditioning
   - build_velocity_net  : factory function driven by config["backbone"]
 
 Paper references (Tong et al., 2024 -- "Improving and Generalizing Flow-Based
@@ -22,6 +23,7 @@ import math
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +33,7 @@ from torch import nn
 class VelocityNet(nn.Module):
     """
     Abstract base for velocity networks used in CFM training.
-    Subclasses must implement ``forward(x, t) -> velocity``.
+    Subclasses must implement ``forward(x, t, class_labels=None) -> velocity``.
     Shared helpers: interpolate, get_velocity, sample.
     """
 
@@ -53,12 +55,13 @@ class VelocityNet(nn.Module):
         return (1 - (1 - self.sigma_min) * t) * x_0 + t * x_1
 
     @torch.no_grad()
-    def sample(self, t_steps, shape, device, noise_sampler=None):
+    def sample(self, t_steps, shape, device, noise_sampler=None, class_labels=None):
         """Generate samples by Euler-integrating the learned ODE
         dx/dt = v_theta(x, t) from t=0 to t=1.
 
         If noise_sampler is provided, initial x_0 is drawn from it (e.g. quantum);
-        otherwise falls back to standard Gaussian."""
+        otherwise falls back to standard Gaussian.
+        class_labels: optional (B,) int tensor for class-conditional generation."""
         if noise_sampler is not None:
             x = noise_sampler.sample(shape, device)
         else:
@@ -68,10 +71,10 @@ class VelocityNet(nn.Module):
 
         for i in range(t_steps - 1):
             t_cur = t_vals[i].view(1, 1, 1, 1).expand(shape[0], 1, 1, 1)
-            x = x + self(x, t_cur) * delta
+            x = x + self(x, t_cur, class_labels=class_labels) * delta
         return x
 
-    def forward(self, x, t):
+    def forward(self, x, t, class_labels=None):
         raise NotImplementedError
 
 
@@ -156,7 +159,7 @@ class ConvStackVelocityNet(VelocityNet):
 
         self.out_project = ConvBlock(hidden_dims[-1], img_c, kernel_size=3)
 
-    def forward(self, x, t):
+    def forward(self, x, t, class_labels=None):
         te = self.time_project(t)
         y = self.in_project(x)
         for block in self.convs:
@@ -192,6 +195,35 @@ class SinusoidalTimeEmbedding(nn.Module):
         return self.mlp(emb)
 
 
+class SelfAttention(nn.Module):
+    """Multi-head self-attention over spatial dimensions with residual connection.
+    Follows the approach from guided-diffusion / DDPM architectures."""
+
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        assert channels % num_heads == 0, f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.norm = nn.GroupNorm(min(8, channels), channels)
+        self.qkv = nn.Conv1d(channels, channels * 3, 1)
+        self.proj = nn.Conv1d(channels, channels, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x).view(B, C, H * W)
+        qkv = self.qkv(h).reshape(B, 3, self.num_heads, self.head_dim, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        scale = self.head_dim ** -0.5
+        attn = torch.einsum("bhdn,bhdm->bhnm", q, k) * scale
+        attn = attn.softmax(dim=-1)
+        out = torch.einsum("bhnm,bhdm->bhdn", attn, v)
+        out = out.reshape(B, C, H * W)
+        out = self.proj(out).view(B, C, H, W)
+        return x + out
+
+
 class ResBlock(nn.Module):
     """Residual block with GroupNorm, SiLU, Conv, and additive time-conditioning."""
 
@@ -216,70 +248,80 @@ class ResBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    """Two ResBlocks followed by a stride-2 downsampling conv."""
+    """Two ResBlocks + optional self-attention + stride-2 downsampling conv."""
 
-    def __init__(self, in_ch, out_ch, time_dim, dropout=0.0):
+    def __init__(self, in_ch, out_ch, time_dim, dropout=0.0, use_attention=False, num_heads=4):
         super().__init__()
         self.res1 = ResBlock(in_ch, time_dim, dropout)
         self.res2 = ResBlock(in_ch, time_dim, dropout)
+        self.attn = SelfAttention(in_ch, num_heads) if use_attention else nn.Identity()
         self.down = nn.Conv2d(in_ch, out_ch, 3, stride=2, padding=1)
 
     def forward(self, x, t_emb):
         h = self.res1(x, t_emb)
         h = self.res2(h, t_emb)
+        h = self.attn(h)
         skip = h
         h = self.down(h)
         return h, skip
 
 
 class UpBlock(nn.Module):
-    """Upsample + concat skip + two ResBlocks."""
+    """Upsample + concat skip + two ResBlocks + optional self-attention."""
 
-    def __init__(self, in_ch, skip_ch, out_ch, time_dim, dropout=0.0):
+    def __init__(self, in_ch, skip_ch, out_ch, time_dim, dropout=0.0, use_attention=False, num_heads=4):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_ch, in_ch, 2, stride=2)
         merged = in_ch + skip_ch
         self.conv_merge = nn.Conv2d(merged, out_ch, 1)
         self.res1 = ResBlock(out_ch, time_dim, dropout)
         self.res2 = ResBlock(out_ch, time_dim, dropout)
+        self.attn = SelfAttention(out_ch, num_heads) if use_attention else nn.Identity()
 
     def forward(self, x, skip, t_emb):
         h = self.up(x)
         if h.shape[-2:] != skip.shape[-2:]:
-            h = nn.functional.interpolate(h, size=skip.shape[-2:], mode="nearest")
+            h = F.interpolate(h, size=skip.shape[-2:], mode="nearest")
         h = torch.cat([h, skip], dim=1)
         h = self.conv_merge(h)
         h = self.res1(h, t_emb)
         h = self.res2(h, t_emb)
+        h = self.attn(h)
         return h
 
 
 class UNetVelocityNet(VelocityNet):
     """
-    U-Net velocity network for CFM.
+    U-Net velocity network for CFM with optional self-attention and class conditioning.
 
     Architecture (for 28x28 MNIST or 32x32 CIFAR):
         Encoder:  [C,H,W] -> [base,H,W] -> [base*2,H/2,W/2] -> [base*4,H/4,W/4]
-        Bottleneck: 2x ResBlock at lowest resolution
+        Bottleneck: ResBlock -> SelfAttention -> ResBlock at lowest resolution
         Decoder:  mirrors encoder with skip connections
         Output:   [C,H,W] (predicted velocity, same shape as input)
 
     Time conditioning: sinusoidal embedding -> MLP -> additive bias at every ResBlock.
+    Class conditioning: nn.Embedding(num_classes, time_dim) added to time embedding.
     """
 
-    def __init__(self, image_resolution, base_channels=64, sigma_min=0.0, dropout=0.0):
+    def __init__(self, image_resolution, base_channels=64, sigma_min=0.0,
+                 dropout=0.0, num_classes=0, use_attention=True, num_heads=4):
         super().__init__(sigma_min=sigma_min)
         _, _, img_c = image_resolution
         time_dim = base_channels * 4
         ch1, ch2, ch3 = base_channels, base_channels * 2, base_channels * 4
 
         self.time_embed = SinusoidalTimeEmbedding(time_dim)
+
+        self.class_embed = nn.Embedding(num_classes, time_dim) if num_classes > 0 else None
+
         self.conv_in = nn.Conv2d(img_c, ch1, 3, padding=1)
 
         self.down1 = DownBlock(ch1, ch2, time_dim, dropout)
         self.down2 = DownBlock(ch2, ch3, time_dim, dropout)
 
         self.bottleneck1 = ResBlock(ch3, time_dim, dropout)
+        self.bottleneck_attn = SelfAttention(ch3, num_heads) if use_attention else nn.Identity()
         self.bottleneck2 = ResBlock(ch3, time_dim, dropout)
 
         self.up1 = UpBlock(ch3, ch2, ch2, time_dim, dropout)
@@ -290,20 +332,25 @@ class UNetVelocityNet(VelocityNet):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
 
-    def forward(self, x, t):
+    def forward(self, x, t, class_labels=None):
         t_emb = self.time_embed(t)
+
+        if class_labels is not None and self.class_embed is not None:
+            t_emb = t_emb + self.class_embed(class_labels)
+
         h = self.conv_in(x)
 
         h, skip1 = self.down1(h, t_emb)
         h, skip2 = self.down2(h, t_emb)
 
         h = self.bottleneck1(h, t_emb)
+        h = self.bottleneck_attn(h)
         h = self.bottleneck2(h, t_emb)
 
         h = self.up1(h, skip2, t_emb)
         h = self.up2(h, skip1, t_emb)
 
-        h = nn.functional.silu(self.norm_out(h))
+        h = F.silu(self.norm_out(h))
         return self.conv_out(h)
 
 
@@ -335,6 +382,9 @@ def build_velocity_net(settings):
             base_channels=settings.get("unet_base_channels", 64),
             sigma_min=sigma_min,
             dropout=settings.get("dropout", 0.0),
+            num_classes=settings.get("num_classes", 0),
+            use_attention=settings.get("use_attention", True),
+            num_heads=settings.get("num_heads", 4),
         )
     else:
         raise ValueError(f"Unknown backbone '{backbone}'. Choose 'convstack' or 'unet'.")

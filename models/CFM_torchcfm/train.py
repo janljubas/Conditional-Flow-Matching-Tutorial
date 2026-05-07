@@ -2,12 +2,17 @@
 """Train CFM model using the torchcfm library (Tong et al.)."""
 
 import json
+import os
 import sys
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
+import hydra
 import matplotlib.pyplot as plt
 import torch
+from omegaconf import DictConfig
 from torch.optim import AdamW
 from torchvision.datasets import CIFAR10, MNIST
 from torchvision.transforms import ToTensor
@@ -21,15 +26,17 @@ from torchcfm.models.unet import UNetModel as UNetModelWrapper
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from noise import build_noise_sampler
-from utils import (
-    build_train_parser,
-    load_yaml_config,
-    prepare_run_dir,
-    resolve_device,
-    resolve_train_settings,
-    seed_everything,
+from experiment import (
+    init_wandb,
+    log_metrics,
+    log_images,
+    log_summary,
+    finish_wandb,
+    compute_fid,
+    log_model_artifact,
 )
+from noise import build_noise_sampler
+from utils import prepare_run_dir, resolve_device, resolve_settings, seed_everything
 
 
 def load_dataset(dataset, dataset_path, train_batch_size, inference_batch_size, num_workers):
@@ -64,8 +71,7 @@ def save_training_curve(run_dir: Path, history):
 
 @torch.no_grad()
 def sample_euler(model, t_steps, shape, device, noise_sampler=None):
-    """Generate samples by Euler-integrating the learned ODE.
-    If noise_sampler is provided, initial x_0 is drawn from it."""
+    """Generate samples by Euler-integrating the learned ODE."""
     if noise_sampler is not None:
         x = noise_sampler.sample(shape, device)
     else:
@@ -122,11 +128,12 @@ def train(settings, run_dir: Path):
     noise_sampler = build_noise_sampler(settings)
     nparams = sum(p.numel() for p in model.parameters())
     print(f"torchcfm UNet | Noise: {settings['noise_source']} | Params: {nparams:,} | CFM variant: {settings['cfm_variant']}")
+    log_summary("num_params", nparams)
 
     optimizer = AdamW(model.parameters(), lr=settings["lr"], betas=(0.9, 0.99))
     cfm = build_cfm(settings)
 
-    train_loader, _ = load_dataset(
+    train_loader, test_loader = load_dataset(
         settings["dataset"],
         settings["dataset_path"],
         settings["train_batch_size"],
@@ -138,78 +145,141 @@ def train(settings, run_dir: Path):
     print("Start training (torchcfm)...")
     model.train()
     start = time.time()
+    global_step = 0
 
     for epoch in range(settings["n_epochs"]):
+        epoch_start = time.time()
         total_loss = 0.0
         for batch_idx, (x_1, _) in enumerate(train_loader):
             optimizer.zero_grad()
             x_1 = x_1.to(device)
             x_0 = noise_sampler.sample_like(x_1)
 
-            # torchcfm computes x_t and u_t for us (Eq.14 + Eq.15)
             t, x_t, u_t = cfm.sample_location_and_conditional_flow(x_0, x_1)
             t = t.to(device)
             x_t = x_t.to(device)
             u_t = u_t.to(device)
 
-            # torchcfm UNet signature: forward(t, x) where t is shape (B,)
             v_pred = model(t, x_t)
 
             loss = ((v_pred - u_t) ** 2).mean()
             total_loss += loss.item()
             loss.backward()
             optimizer.step()
+            global_step += 1
 
             if batch_idx % 100 == 0:
                 grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
                 print(f"\t\tCFM loss: {loss.item():.6f}  grad_norm: {grad_norm:.4f}")
+                log_metrics({"batch_loss": loss.item(), "grad_norm": grad_norm}, step=global_step)
 
         epoch_loss = total_loss / len(train_loader)
+        epoch_time = time.time() - epoch_start
         history["epoch"].append(epoch + 1)
         history["train_loss"].append(float(epoch_loss))
         print(f"\tEpoch {epoch + 1} complete!\tCFM loss: {epoch_loss:.6f}")
+        log_metrics({"train_loss": epoch_loss, "epoch": epoch + 1, "epoch_time_sec": epoch_time}, step=global_step)
 
-        if (epoch + 1) % settings["checkpoint_every"] == 0 or epoch + 1 == settings["n_epochs"]:
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "settings": settings,
-                    "epoch_loss": float(epoch_loss),
-                },
-                checkpoints_dir / f"epoch_{epoch + 1:04d}.pt",
-            )
+        epoch_num = epoch + 1
+        ce = max(1, int(settings["checkpoint_every"]))
+        save_epochs = settings.get("save_epoch_checkpoints", True)
+        wb_every = int(settings.get("wandb_log_model_artifact_every", 0) or 0)
+        disk_save = save_epochs and (epoch_num % ce == 0 or epoch_num == settings["n_epochs"])
+        wb_mid = wb_every > 0 and (epoch_num % wb_every == 0 or epoch_num == settings["n_epochs"])
+
+        ckpt_payload = {
+            "epoch": epoch_num,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "settings": settings,
+            "epoch_loss": float(epoch_loss),
+        }
+
+        ckpt_path = None
+        if disk_save:
+            ckpt_path = checkpoints_dir / f"epoch_{epoch_num:04d}.pt"
+            torch.save(ckpt_payload, ckpt_path)
+
+        if wb_mid:
+            if ckpt_path is not None and ckpt_path.is_file():
+                log_model_artifact(
+                    ckpt_path,
+                    f"checkpoint-epoch-{epoch_num}",
+                    metadata={"epoch": epoch_num, "epoch_loss": float(epoch_loss)},
+                )
+            else:
+                fd, tmp_name = tempfile.mkstemp(suffix=".pt", prefix=f"ckpt_e{epoch_num}_", dir=str(run_dir))
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    torch.save(ckpt_payload, tmp_path)
+                    log_model_artifact(
+                        tmp_path,
+                        f"checkpoint-epoch-{epoch_num}",
+                        metadata={"epoch": epoch_num, "epoch_loss": float(epoch_loss)},
+                    )
+                finally:
+                    tmp_path.unlink(missing_ok=True)
 
     elapsed_sec = round(time.time() - start, 4)
-    torch.save(
-        {"model_state_dict": model.state_dict(), "settings": settings},
-        checkpoints_dir / "last.pt",
-    )
+    save_last = settings.get("save_last_checkpoint", True)
+    last_path = checkpoints_dir / "last.pt"
+    if save_last:
+        torch.save({"model_state_dict": model.state_dict(), "settings": settings}, last_path)
+    if settings.get("wandb_log_model_artifact", False) and save_last and last_path.is_file():
+        log_model_artifact(last_path, "last-model", metadata={"epoch": settings["n_epochs"]})
     save_training_curve(run_dir, history)
-    save_sample_grid(
-        model=model,
-        run_dir=run_dir,
-        sample_steps=settings["sample_steps"],
-        num_sample_images=settings["num_sample_images"],
-        img_size=settings["img_size"],
-        device=device,
-        noise_sampler=noise_sampler,
-    )
-    return {"history": history, "elapsed_sec": elapsed_sec}
+
+    sample_steps = settings["sample_steps"]
+    num_sample_images = settings["num_sample_images"]
+
+    model.eval()
+    save_sample_grid(model, run_dir, sample_steps, num_sample_images, settings["img_size"], device, noise_sampler)
+
+    generated_for_log = sample_euler(model, t_steps=sample_steps, shape=[min(64, num_sample_images), c, h, w], device=device, noise_sampler=noise_sampler)
+    log_images("samples", generated_for_log, caption=f"steps={sample_steps}")
+
+    num_fid = settings.get("num_fid_samples", 1024)
+    if num_fid > 0:
+        def gen_fn(n):
+            return sample_euler(model, t_steps=sample_steps, shape=[n, c, h, w], device=device, noise_sampler=noise_sampler)
+        fid_score = compute_fid(gen_fn, test_loader, num_fid, device)
+        if fid_score is not None:
+            log_summary("fid", fid_score)
+            history["fid"] = fid_score
+    else:
+        fid_score = None
+
+    log_summary("final_train_loss", history["train_loss"][-1])
+    log_summary("elapsed_sec", elapsed_sec)
+
+    return {"history": history, "elapsed_sec": elapsed_sec, "fid": fid_score}
 
 
-def main():
-    args = build_train_parser().parse_args()
-    run_dir = prepare_run_dir(args.run_dir, "CFM_torchcfm")
-    config = load_yaml_config(Path(args.config))
-    settings = resolve_train_settings(args, config)
+@hydra.main(version_base="1.3", config_path=".", config_name="config")
+def main(cfg: DictConfig) -> None:
+    settings = resolve_settings(cfg)
 
+    if settings.get("run_dir") is None:
+        repo_root = Path(__file__).resolve().parents[2]
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        settings["run_dir"] = str(repo_root / "runs" / "CFM_torchcfm" / timestamp)
+
+    run_dir = prepare_run_dir(settings["run_dir"], "CFM_torchcfm")
+
+    init_wandb(settings, run_dir, pipeline_name="cfm-torchcfm")
     out = train(settings, run_dir)
-    metrics = {"pipeline": "cfm_torchcfm", "elapsed_sec": out["elapsed_sec"], "settings": settings}
-    (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+    metrics = {
+        "pipeline": "cfm-torchcfm",
+        "elapsed_sec": out["elapsed_sec"],
+        "fid": out.get("fid"),
+        "settings": settings,
+    }
+    (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     (run_dir / "history.json").write_text(json.dumps(out["history"], indent=2))
 
+    finish_wandb()
     print("Finish!!")
     print(f"Run directory: {run_dir}")
 

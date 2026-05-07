@@ -1,4 +1,3 @@
-import argparse
 import random
 from pathlib import Path
 
@@ -6,10 +5,70 @@ import numpy as np
 import torch
 
 
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def resolve_device(settings):
+    if settings["cuda"] and torch.cuda.is_available():
+        torch.cuda.set_device(settings["gpu_id"])
+        return torch.device(f"cuda:{settings['gpu_id']}")
+    return torch.device("cpu")
+
+
+def prepare_run_dir(run_dir_str, model_name):
+    repo_root = Path(__file__).resolve().parents[2]
+    allowed_root = (repo_root / "runs" / model_name).resolve()
+    run_dir = Path(run_dir_str).expanduser()
+    if not run_dir.is_absolute():
+        run_dir = repo_root / run_dir
+    run_dir = run_dir.resolve()
+    if run_dir != allowed_root and allowed_root not in run_dir.parents:
+        raise ValueError(f"run_dir must be inside '{allowed_root}'. Got '{run_dir}'.")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def resolve_settings(cfg) -> dict:
+    """Convert Hydra DictConfig to a validated plain-dict settings object."""
+    from omegaconf import OmegaConf
+    s = OmegaConf.to_container(cfg, resolve=True)
+
+    s["dataset"] = str(s.get("dataset", "mnist")).lower()
+    s["backbone"] = str(s.get("backbone", "unet")).lower()
+    s["noise_source"] = str(s.get("noise_source", "gaussian")).lower()
+
+    s["dataset_path"] = str(Path(s.get("dataset_path", "~/datasets")).expanduser())
+    qpath = s.get("quantum_data_path", "")
+    s["quantum_data_path"] = str(Path(qpath).expanduser()) if qpath else ""
+
+    if s["dataset"] not in {"mnist", "cifar10"}:
+        raise ValueError(f"Unsupported dataset '{s['dataset']}'.")
+    if s["backbone"] not in {"convstack", "unet"}:
+        raise ValueError(f"Unsupported backbone '{s['backbone']}'. Choose 'convstack' or 'unet'.")
+    if s["noise_source"] not in {"gaussian", "quantum"}:
+        raise ValueError(f"Unsupported noise_source '{s['noise_source']}'. Choose 'gaussian' or 'quantum'.")
+    if s["noise_source"] == "quantum" and not s["quantum_data_path"]:
+        raise ValueError("noise_source='quantum' requires a non-empty 'quantum_data_path'.")
+
+    s["img_size"] = (32, 32, 3) if s["dataset"] == "cifar10" else (28, 28, 1)
+    s["hidden_dims"] = [s.get("hidden_dim", 256)] * s.get("n_layers", 8)
+
+    s.pop("hydra", None)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Legacy argparse API — kept for infer.py (will be migrated separately)
+# ---------------------------------------------------------------------------
+import argparse
+
+
 def str2bool(value):
-    '''
-    Safely converts a string to a boolean value (better than bool(value) which is not always reliable).
-    '''
     if isinstance(value, bool):
         return value
     lowered = str(value).strip().lower()
@@ -21,136 +80,40 @@ def str2bool(value):
 
 
 def load_yaml_config(config_path: Path):
-    '''
-    Loads a YAML config file into a dictionary, with error handling for missing/invalid files.
-    '''
     try:
         import yaml
     except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "PyYAML is required to read config files. Install with: pip install pyyaml"
-        ) from exc
-
+        raise ModuleNotFoundError("PyYAML required: pip install pyyaml") from exc
     config = yaml.safe_load(config_path.read_text()) or {}
     if not isinstance(config, dict):
-        raise ValueError("Config file must contain a top-level mapping/dictionary.")
+        raise ValueError("Config file must contain a top-level mapping.")
     return config
 
 
 def pick_value(cli_value, config, key, default):
-    '''
-    Picks a value from the command line arguments or the config file, with fallback to a default value.
-    '''
     return cli_value if cli_value is not None else config.get(key, default)
 
 
-def _common_parser(description):
-    '''
-    Builds a common argument parser for all CFM models.
-    '''
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--config", required=True, help="Path to YAML config file.")
-    parser.add_argument("--run-dir", required=True, help="Directory to write run outputs.")
-    parser.add_argument("--dataset-path", default=None, help="Dataset path (default from config).")
-    parser.add_argument("--dataset", default=None, help="Dataset name (default from config).")
-    parser.add_argument("--gpu-id", type=int, default=None, help="GPU ID (default from config).")
-    parser.add_argument("--cuda", type=str2bool, default=None, help="Use CUDA (default from config).")
-    parser.add_argument("--hidden-dim", type=int, default=None, help="Hidden dimension (default from config).")
-    parser.add_argument("--n-layers", type=int, default=None, help="Number of layers (default from config).")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (default from config).")
-    parser.add_argument("--num-workers", type=int, default=None, help="Number of workers (default from config).")
-    parser.add_argument("--backbone", default=None, help="Velocity net backbone: 'convstack' or 'unet' (default from config).")
-    parser.add_argument("--noise-source", default=None, help="Noise source: 'gaussian' or 'quantum' (default from config).")
-    parser.add_argument("--quantum-data-path", default=None, help="Path to quantum data folder (default from config).")
-    return parser
-
-
-def build_train_parser():
-    '''
-    Builds a parser for the train command.
-    '''
-    parser = _common_parser("Train CFM model.")
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--sigma-min", type=float, default=None)
-    parser.add_argument("--n-epochs", type=int, default=None)
-    parser.add_argument("--train-batch-size", type=int, default=None)
-    parser.add_argument("--checkpoint-every", type=int, default=None)
-    parser.add_argument("--sample-steps", type=int, default=None)
-    parser.add_argument("--num-sample-images", type=int, default=None)
-    return parser
-
-
 def build_infer_parser():
-    '''
-    Builds a parser for the inference command.
-    '''
-    parser = _common_parser("Run CFM inference from checkpoint.")
-    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint (*.pt).")
+    parser = argparse.ArgumentParser(description="Run CFM inference from checkpoint.")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--dataset-path", default=None)
+    parser.add_argument("--dataset", default=None)
+    parser.add_argument("--gpu-id", type=int, default=None)
+    parser.add_argument("--cuda", type=str2bool, default=None)
+    parser.add_argument("--hidden-dim", type=int, default=None)
+    parser.add_argument("--n-layers", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--inference-batch-size", type=int, default=None)
     parser.add_argument("--sample-steps", type=int, default=None)
     parser.add_argument("--num-sample-images", type=int, default=None)
     return parser
 
 
-def resolve_device(settings):
-    '''
-    Resolves the device to use for the model based on the settings, e.g. "cuda:0" or "cpu". In other words, it uses the GPU if available, otherwise it uses the CPU.
-    '''
-    if settings["cuda"] and torch.cuda.is_available():
-        torch.cuda.set_device(settings["gpu_id"])
-        return torch.device(f"cuda:{settings['gpu_id']}")
-    return torch.device("cpu")
-
-
-def resolve_train_settings(args, config):
-    '''
-    Final check and formatting of the args and configs for the training settings.
-    It makes sure that the model training method doesn't receive invalid values; it throws an error beforehand (easier to debug).
-    Returns a dictionary of the final run settings (called "settings" in the code, instead of "config").
-    '''
-    backbone = str(pick_value(args.backbone, config, "backbone", "convstack")).lower()
-    noise_source = str(pick_value(args.noise_source, config, "noise_source", "gaussian")).lower()
-    qpath = pick_value(args.quantum_data_path, config, "quantum_data_path", "")
-    settings = {
-        "dataset_path": str(Path(pick_value(args.dataset_path, config, "dataset_path", "~/datasets")).expanduser()),
-        "dataset": str(pick_value(args.dataset, config, "dataset", "mnist")).lower(),
-        "gpu_id": int(pick_value(args.gpu_id, config, "gpu_id", 0)),
-        "cuda": bool(pick_value(args.cuda, config, "cuda", True)),
-        "backbone": backbone,
-        "hidden_dim": int(pick_value(args.hidden_dim, config, "hidden_dim", 256)),
-        "n_layers": int(pick_value(args.n_layers, config, "n_layers", 8)),
-        "unet_base_channels": int(config.get("unet_base_channels", 64)),
-        "dropout": float(config.get("dropout", 0.0)),
-        "noise_source": noise_source,
-        "quantum_data_path": str(Path(qpath).expanduser()) if qpath else "",
-        "lr": float(pick_value(args.lr, config, "lr", 5e-5)),
-        "sigma_min": float(pick_value(args.sigma_min, config, "sigma_min", 0.0)),
-        "n_epochs": int(pick_value(args.n_epochs, config, "n_epochs", 10)),
-        "train_batch_size": int(pick_value(args.train_batch_size, config, "train_batch_size", 128)),
-        "inference_batch_size": int(pick_value(None, config, "inference_batch_size", 64)),
-        "seed": int(pick_value(args.seed, config, "seed", 1234)),
-        "num_workers": int(pick_value(args.num_workers, config, "num_workers", 1)),
-        "checkpoint_every": int(pick_value(args.checkpoint_every, config, "checkpoint_every", 1)),
-        "sample_steps": int(pick_value(args.sample_steps, config, "sample_steps", 25)),
-        "num_sample_images": int(pick_value(args.num_sample_images, config, "num_sample_images", 64)),
-    }
-    if settings["dataset"] not in {"mnist", "cifar10"}:
-        raise ValueError(f"Unsupported dataset '{settings['dataset']}'.")
-    if settings["backbone"] not in {"convstack", "unet"}:
-        raise ValueError(f"Unsupported backbone '{settings['backbone']}'. Choose 'convstack' or 'unet'.")
-    if noise_source not in {"gaussian", "quantum"}:
-        raise ValueError(f"Unsupported noise_source '{noise_source}'. Choose 'gaussian' or 'quantum'.")
-    if noise_source == "quantum" and not settings["quantum_data_path"]:
-        raise ValueError("noise_source='quantum' requires a non-empty 'quantum_data_path'.")
-    settings["img_size"] = (32, 32, 3) if settings["dataset"] == "cifar10" else (28, 28, 1)
-    settings["hidden_dims"] = [settings["hidden_dim"] for _ in range(settings["n_layers"])]
-    return settings
-
-
 def resolve_infer_settings(args, config):
-    '''
-    Same thing, but for the inference settings.
-    '''
     settings = {
         "dataset_path": str(Path(pick_value(args.dataset_path, config, "dataset_path", "~/datasets")).expanduser()),
         "dataset": str(pick_value(args.dataset, config, "dataset", "mnist")).lower(),
@@ -159,9 +122,7 @@ def resolve_infer_settings(args, config):
         "hidden_dim": int(pick_value(args.hidden_dim, config, "hidden_dim", 256)),
         "n_layers": int(pick_value(args.n_layers, config, "n_layers", 8)),
         "sigma_min": float(pick_value(None, config, "sigma_min", 0.0)),
-        "inference_batch_size": int(
-            pick_value(args.inference_batch_size, config, "inference_batch_size", 64)
-        ),
+        "inference_batch_size": int(pick_value(args.inference_batch_size, config, "inference_batch_size", 64)),
         "sample_steps": int(pick_value(args.sample_steps, config, "sample_steps", 25)),
         "num_sample_images": int(pick_value(args.num_sample_images, config, "num_sample_images", 64)),
         "seed": int(pick_value(args.seed, config, "seed", 1234)),
@@ -170,38 +131,5 @@ def resolve_infer_settings(args, config):
     if settings["dataset"] not in {"mnist", "cifar10"}:
         raise ValueError(f"Unsupported dataset '{settings['dataset']}'.")
     settings["img_size"] = (32, 32, 3) if settings["dataset"] == "cifar10" else (28, 28, 1)
-    settings["hidden_dims"] = [settings["hidden_dim"] for _ in range(settings["n_layers"])]
+    settings["hidden_dims"] = [settings["hidden_dim"]] * settings["n_layers"]
     return settings
-
-
-def seed_everything(seed):
-    '''
-    Seeds the random number generators for reproducibility.
-    '''
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def prepare_run_dir(run_dir_arg, model_name):
-    '''
-    Resolve and create run directory, restricted to repo-local runs/<model_name>/... (e.g. runs/CFM/... for the CFM model).
-    Without this restriction, users could potentially overwrite other runs or data by accident.
-    '''
-    repo_root = Path(__file__).resolve().parents[2]
-    allowed_root = (repo_root / "runs" / model_name).resolve()
-
-    run_dir = Path(run_dir_arg).expanduser()
-    if not run_dir.is_absolute():
-        run_dir = repo_root / run_dir
-    run_dir = run_dir.resolve()
-
-    if run_dir != allowed_root and allowed_root not in run_dir.parents:
-        raise ValueError(
-            f"--run-dir must be inside '{allowed_root}'. Got '{run_dir}'."
-        )
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
