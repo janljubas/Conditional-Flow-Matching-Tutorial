@@ -55,6 +55,15 @@ def resolve_settings(cfg) -> dict:
     if s["noise_source"] == "quantum" and not s["quantum_data_path"]:
         raise ValueError("noise_source='quantum' requires a non-empty 'quantum_data_path'.")
 
+    # Phase 1: validate quantum_projection early so typos fail before data load.
+    s["quantum_projection"] = str(s.get("quantum_projection", "linear")).lower()
+    _allowed_proj = {"linear", "multi_sample", "multi_sample_pe", "hybrid", "fourier"}
+    if s["noise_source"] == "quantum" and s["quantum_projection"] not in _allowed_proj:
+        raise ValueError(
+            f"Unsupported quantum_projection '{s['quantum_projection']}'. "
+            f"Choose one of: {sorted(_allowed_proj)}"
+        )
+
     s["img_size"] = (32, 32, 3) if s["dataset"] == "cifar10" else (28, 28, 1)
     s["hidden_dims"] = [s.get("hidden_dim", 256)] * s.get("n_layers", 8)
 
