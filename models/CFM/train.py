@@ -92,10 +92,32 @@ def train(settings, run_dir: Path):
     device = resolve_device(settings)
     model = build_velocity_net(settings).to(device)
     noise_sampler = build_noise_sampler(settings)
+
+    # Some samplers (e.g. Strategy 5: QuantumSamplerMLP) are nn.Modules with
+    # trainable parameters. We move them to the device, set train mode, and
+    # combine their params with the velocity net's into a single optimizer.
+    sampler_is_module = isinstance(noise_sampler, torch.nn.Module)
+    if sampler_is_module:
+        noise_sampler.to(device)
+        noise_sampler.train()
+
     nparams = sum(p.numel() for p in model.parameters())
-    print(f"Backbone: {settings['backbone']} | Noise: {settings['noise_source']} | Params: {nparams:,}")
+    sampler_nparams = (
+        sum(p.numel() for p in noise_sampler.parameters()) if sampler_is_module else 0
+    )
+    print(
+        f"Backbone: {settings['backbone']} | Noise: {settings['noise_source']} "
+        f"| Velocity-net params: {nparams:,}"
+        + (f" | Sampler params: {sampler_nparams:,}" if sampler_is_module else "")
+    )
     log_summary("num_params", nparams)
-    optimizer = AdamW(model.parameters(), lr=settings["lr"], betas=(0.9, 0.99))
+    if sampler_is_module:
+        log_summary("num_sampler_params", sampler_nparams)
+
+    trainable_params = list(model.parameters())
+    if sampler_is_module:
+        trainable_params += list(noise_sampler.parameters())
+    optimizer = AdamW(trainable_params, lr=settings["lr"], betas=(0.9, 0.99))
 
     train_loader, test_loader = load_dataset(
         settings["dataset"],
@@ -134,7 +156,7 @@ def train(settings, run_dir: Path):
             global_step += 1
 
             if batch_idx % 100 == 0:
-                grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
+                grad_norm = sum(p.grad.norm().item() for p in trainable_params if p.grad is not None)
                 print("\t\tCFM loss:", loss.item(), " grad_norm:", grad_norm)
                 log_metrics({"batch_loss": loss.item(), "grad_norm": grad_norm}, step=global_step)
 
@@ -159,6 +181,8 @@ def train(settings, run_dir: Path):
             "settings": settings,
             "epoch_loss": float(epoch_loss),
         }
+        if sampler_is_module:
+            ckpt_payload["noise_sampler_state_dict"] = noise_sampler.state_dict()
 
         ckpt_path = None
         if disk_save:
@@ -190,7 +214,10 @@ def train(settings, run_dir: Path):
     save_last = settings.get("save_last_checkpoint", True)
     last_path = checkpoints_dir / "last.pt"
     if save_last:
-        torch.save({"model_state_dict": model.state_dict(), "settings": settings}, last_path)
+        last_payload = {"model_state_dict": model.state_dict(), "settings": settings}
+        if sampler_is_module:
+            last_payload["noise_sampler_state_dict"] = noise_sampler.state_dict()
+        torch.save(last_payload, last_path)
     if settings.get("wandb_log_model_artifact", False) and save_last and last_path.is_file():
         log_model_artifact(last_path, "last-model", metadata={"epoch": settings["n_epochs"]})
     save_training_curve(run_dir, history)
@@ -205,6 +232,8 @@ def train(settings, run_dir: Path):
         return None
 
     model.eval()
+    if sampler_is_module:
+        noise_sampler.eval()
     save_sample_grid(model, run_dir, sample_steps, num_sample_images, settings["img_size"], device,
                      noise_sampler=noise_sampler, class_labels=_rand_labels(num_sample_images))
 

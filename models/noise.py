@@ -3,20 +3,28 @@ Noise source abstraction for CFM training and sampling.
 
 Available samplers
 --------------------------------------------
-  (Phase 0)
+  (Phase 1.A)
   GaussianNoiseSampler          - standard N(0, I)
   QuantumSamplerLinear          - rank-8 single linear projection (baseline)
 
-  (Phase 1)
+  (Phase 1.B)
   QuantumSamplerMultiSample     - Strategy 1: k samples tiled spatially
   QuantumSamplerMultiSamplePE   - Strategy 2: Strategy 1 + sinusoidal PE
   QuantumSamplerHybrid          - Strategy 3: alpha * q + sqrt(1 - alpha^2) * eps
   QuantumSamplerFourier         - Strategy 4: sin/cos basis expansion, then projection
 
-All quantum samplers share:
+  (Phase 1.D)
+  QuantumSamplerMLP             - Strategy 5: trainable MLP from k stacked
+                                  R^D quantum vectors to flat image. The ONLY
+                                  sampler whose parameters are learned end-to-end
+                                  with the velocity network (it is an nn.Module
+                                  and the train scripts add its params to the
+                                  optimizer).
+
+Quantum-pool samplers (all except Gaussian) share:
   - Pool loading from .pt files in `quantum_data_path`
   - Per-dimension affine rescaling to zero mean / unit variance
-  - A fixed `projection_seed` for reproducible projection matrices
+  - A fixed `projection_seed` for reproducible projection matrices (Strategies 1-4)
 
 Why these strategies?
 The current quantum pool is 8-dim, MNIST is 784-dim. A single linear
@@ -25,14 +33,19 @@ of pixel space is reachable, the other 776 dims are deterministic given
 which 8-D point was drawn. With a finite pool (~64,720 samples) every
 MNIST image effectively gets a near-deterministic low-dim "tag", and the
 model overfits the (proj, x_1) coupling -- low train loss, terrible FID.
-The strategies from Phase 1 try to overcome this failure mode by either raising the effective rank of the projected
-noise (Multi-sample, Multi-sample with PE, Fourier) or guarantee full rank by construction (Hybrid).
+Strategies 1-4 try to overcome this failure mode by either raising the
+effective rank of the projected noise (Multi-sample, Multi-sample with PE,
+Fourier) or guaranteeing full rank by construction (Hybrid). Strategy 5
+(MLP) takes a different tack: replace the fixed random projection with a
+trainable MLP, so the projection from quantum space to image space is
+data-adapted instead of random.
 """
 
 import math
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 
 # ---------------------------------------------------------------------------
@@ -125,22 +138,40 @@ class _QuantumPoolBase:
         idx = torch.randint(0, self.pool.shape[0], (n,))
         return self.pool[idx].to(device=device, dtype=dtype)         # [n, D]
 
-    def _get_projection(self, in_dim, out_dim, device, dtype, name="proj"):
+    def _get_projection(self, in_dim, out_dim, device, dtype, name="proj", unit_columns=False):
         """
         Cached fixed-random projection matrix of shape [in_dim, out_dim].
 
-        Variance normalization (1/sqrt(in_dim)) keeps output entries unit-
-        variance when input entries are unit-variance Gaussian, matching
-        the marginal scale of an N(0, I) baseline.
+        Variance normalization keeps output coords ~unit-variance when input
+        coords are unit-variance Gaussian, matching the marginal scale of an
+        N(0, I) baseline:
+
+          unit_columns=False (default, used by linear/hybrid/fourier):
+            scale entries by 1/sqrt(in_dim) -> E[var(output)] = 1, but a
+            single realization has var that fluctuates by O(1/sqrt(in_dim)).
+            For the linear sampler (out_dim=784, single shared row across
+            pixels) the per-pixel fluctuations average out to std ~1.0.
+
+          unit_columns=True (used by multi_sample/multi_sample_pe):
+            scale each column to unit Euclidean norm -> output var is
+            exactly 1 per coord. This matters when the SAME small projection
+            (e.g. D=8 -> region_flat=4) is reused across many regions: the
+            column-norm bias is fixed across all regions, so without this
+            normalization the marginal std can drift to ~0.85 for fine
+            tilings (k=196 etc.).
 
         `name` namespaces the cache so different strategies (linear, multi,
         fourier) generate independent projection matrices instead of sharing.
         """
-        key = (name, in_dim, out_dim, device, dtype)
+        key = (name, in_dim, out_dim, device, dtype, unit_columns)
         if key not in self._proj_cache:
             seed = self._projection_seed + (hash(name) % (2**31))
             gen = torch.Generator().manual_seed(seed)
-            W = torch.randn(in_dim, out_dim, generator=gen, dtype=dtype) / (in_dim ** 0.5)
+            W = torch.randn(in_dim, out_dim, generator=gen, dtype=dtype)
+            if unit_columns:
+                W = W / W.norm(dim=0, keepdim=True).clamp(min=1e-8)
+            else:
+                W = W / (in_dim ** 0.5)
             self._proj_cache[key] = W.to(device)
         return self._proj_cache[key]
 
@@ -215,22 +246,33 @@ def _tiling_layout(tiling, shape_tail, patch_size):
         return k, region_flat, to_image
 
     if tiling == "patch":
-        # Image is split into a grid of (H/p) x (W/p) patches of size p x p.
-        if H % patch_size or W % patch_size:
+        # Normalize patch_size to (ph, pw). Allow rectangular patches so we
+        # can hit k values that don't admit a square tiling -- e.g. k=98 needs
+        # 2x4 patches on 28x28 (98 = 14*7), giving full theoretical rank.
+        if isinstance(patch_size, (list, tuple)):
+            if len(patch_size) != 2:
+                raise ValueError(
+                    f"patch_size as list/tuple must have length 2, got {patch_size}."
+                )
+            ph, pw = int(patch_size[0]), int(patch_size[1])
+        else:
+            ph = pw = int(patch_size)
+
+        if H % ph or W % pw:
             raise ValueError(
-                f"patch_size={patch_size} must divide H={H} and W={W}."
+                f"patch_size=({ph},{pw}) must divide H={H} and W={W}."
             )
-        nh, nw = H // patch_size, W // patch_size
+        nh, nw = H // ph, W // pw
         k = nh * nw
-        region_flat = C * patch_size * patch_size
+        region_flat = C * ph * pw
 
         def to_image(t):
             B = t.shape[0]
-            # [B, k, C*p*p] -> [B, nh, nw, C, p, p]
-            #               -> [B, C, nh, p, nw, p]   (interleave grid + patch dims)
-            #               -> [B, C, H, W]
+            # [B, k, C*ph*pw] -> [B, nh, nw, C, ph, pw]
+            #                 -> [B, C, nh, ph, nw, pw]  (interleave grid + patch dims)
+            #                 -> [B, C, H, W]
             return (
-                t.view(B, nh, nw, C, patch_size, patch_size)
+                t.view(B, nh, nw, C, ph, pw)
                  .permute(0, 3, 1, 4, 2, 5)
                  .reshape(B, C, H, W)
             )
@@ -251,11 +293,15 @@ class QuantumSamplerMultiSample(_QuantumPoolBase):
 
     Tilings:
       'row'   : k = H (each row gets its own draw, region size C*W)
-      'patch' : k = (H/p)*(W/p) (each p x p patch gets its own draw)
+      'patch' : k = (H/ph)*(W/pw) -- patch_size may be int (square) or [ph,pw]
+                (rectangular). Use rectangular to reach k values without a
+                square divisor (e.g. patch_size=[2,4] on 28x28 -> k=98).
 
-    Effective rank rises from D (=8) to min(D*k, C*H*W). For row-tiled MNIST
-    with k=28 this is 8*28 = 224 (vs 8 in the baseline) -- still incomplete,
-    but qualitatively a different regime.
+    Effective rank rises from D (=8) to min(D*k, C*H*W). Examples on 28x28:
+      - row tiling           k=28,  D*k = 224  (partial rank)
+      - patch [4,4]          k=49,  D*k = 392  (partial rank)
+      - patch [2,4]          k=98,  D*k = 784  (full rank by construction)
+      - patch [2,2]          k=196, region=4, min(D,4)*k = 784 (full rank)
 
     Note: we use a single shared projection (not k different ones) so that
     every region is statistically identical -- this means the rank gain is
@@ -278,7 +324,12 @@ class QuantumSamplerMultiSample(_QuantumPoolBase):
         z = self._pretransform(z, k, device, dtype)                       # [B, k, D]
 
         # Single shared projection: every region uses the same R^D -> R^region_flat.
-        W = self._get_projection(self.qdim, region_flat, device, dtype, name="multi")
+        # `unit_columns=True` -> each output coord has variance exactly 1
+        # (avoids the column-norm bias becoming a fixed scale offset across
+        # all regions when D=8 and region_flat is small, e.g. k=196 -> 4).
+        W = self._get_projection(
+            self.qdim, region_flat, device, dtype, name="multi", unit_columns=True
+        )
         proj = z @ W                                                      # [B, k, region_flat]
         return to_image(proj)                                             # [B, C, H, W]
 
@@ -503,6 +554,174 @@ class QuantumSamplerFourier(_QuantumPoolBase):
 
 
 # ---------------------------------------------------------------------------
+# Strategy 5 -- Trainable MLP from k stacked quantum vectors to image
+# ---------------------------------------------------------------------------
+
+class QuantumSamplerMLP(_QuantumPoolBase, nn.Module):
+    """
+    Strategy 5 (Phase 1.D) -- Trainable MLP from k stacked quantum vectors to image.
+
+    For each image we draw k independent quantum samples (each in R^D=R^8),
+    concatenate them into a single [k*D]-dim vector, and pass that vector
+    through a trainable multi-layer MLP with non-linear activations to
+    produce a flat [H*W*C] image vector. The result is reshaped to
+    [B, C, H, W] and used as x_0 in the CFM training loop.
+
+    Unlike Strategies 1-4, this sampler is an nn.Module: its parameters
+    are optimized end-to-end with the velocity network. The training
+    scripts detect this via isinstance(sampler, nn.Module) and combine
+    the parameter groups in the optimizer. Inference scripts likewise
+    load the sampler's state_dict from the checkpoint.
+
+    Choice of k (input_dim = k * D = k * 8):
+      k=96  -> input_dim 768, slightly under image dim 784 (16-dim deficit)
+      k=98  -> input_dim 784, exactly matches image dim
+      k=128 -> input_dim 1024, ~30% oversubscribed (full theoretical rank)
+
+    Why MLP, not learned linear?
+      A learned linear (k*D)->784 has rank min(k*D, 784) -- equivalent to
+      multi_sample for k*D >= 784. The MLP's nonlinearities (GELU) let the
+      network compose data-adapted feature maps that can in principle
+      exceed the linear rank of the input. Empirically this is the first
+      strategy where the projection from quantum space to image space is
+      data-aware rather than fixed random.
+
+    Architecture (defaults):
+      input -> Linear(k*D, hidden_dim) -> GELU
+            -> Linear(hidden_dim, hidden_dim) -> GELU      (n_hidden_layers - 1 times)
+            -> Linear(hidden_dim, output_dim)
+            -> multiply by learnable scalar `output_scale`
+      For k=96, hidden=512, n_hidden_layers=2: ~1.06M trainable params.
+
+    Variance handling:
+      Inputs are unit-variance per dim (rescaled by _QuantumPoolBase).
+      Hidden layers use He init (good for GELU). Final layer uses Xavier
+      uniform (no activation after) so output variance ~1.0 at init. A
+      learnable scalar `output_scale` (init 1.0) lets the model adjust
+      the marginal variance during training without forcing it to.
+
+    Notes:
+      - The k draws are sampled fresh per call (per training step), so
+        each batch sees different quantum noise even though the MLP is
+        deterministic.
+      - The pool stays on CPU (managed by _QuantumPoolBase); only the
+        MLP parameters move to GPU via .to(device).
+      - This sampler does NOT use _get_projection (no fixed random matrix
+        is needed; the MLP IS the projection).
+    """
+
+    _ALLOWED_ACTIVATIONS = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}
+
+    def __init__(
+        self,
+        quantum_data_path,
+        output_dim,
+        k=96,
+        hidden_dim=512,
+        n_hidden_layers=2,
+        activation="gelu",
+        projection_seed=42,
+        **kwargs,
+    ):
+        nn.Module.__init__(self)
+        _QuantumPoolBase.__init__(
+            self,
+            quantum_data_path=quantum_data_path,
+            projection_seed=projection_seed,
+            **kwargs,
+        )
+
+        self.k = int(k)
+        self.input_dim = self.k * self.qdim
+        self.output_dim = int(output_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.n_hidden_layers = int(n_hidden_layers)
+
+        act_key = str(activation).lower()
+        if act_key not in self._ALLOWED_ACTIVATIONS:
+            raise ValueError(
+                f"Unknown activation '{activation}'. Choose from "
+                f"{sorted(self._ALLOWED_ACTIVATIONS)}."
+            )
+        act_cls = self._ALLOWED_ACTIVATIONS[act_key]
+
+        # Build [in -> hidden -> ... -> hidden -> out] with activations between
+        # every pair *except* after the last layer (output should be linear so
+        # marginal variance is controllable).
+        dims = (
+            [self.input_dim]
+            + [self.hidden_dim] * self.n_hidden_layers
+            + [self.output_dim]
+        )
+        layers = []
+        n_pairs = len(dims) - 1
+        for i, (d_in, d_out) in enumerate(zip(dims[:-1], dims[1:])):
+            lin = nn.Linear(d_in, d_out)
+            self._init_linear(lin, is_final=(i == n_pairs - 1))
+            layers.append(lin)
+            if i < n_pairs - 1:
+                layers.append(act_cls())
+        self.mlp = nn.Sequential(*layers)
+
+        # Learnable output scale (lets the model tune marginal std).
+        # We calibrate this from actual quantum-pool samples at init so the
+        # initial output has ~unit variance, matching the Gaussian baseline
+        # and the other quantum samplers (which all produce ~N(0,1)-marginal
+        # noise). Without calibration, He init + GELU + Xavier final layer
+        # produces ~0.80 std for k=96 / ~0.84 for k=128 (empirical), which
+        # would silently make the source noise smaller than the baselines.
+        self.output_scale = nn.Parameter(torch.ones(1))
+        self._calibrate_output_scale(n_samples=1024)
+
+    @torch.no_grad()
+    def _calibrate_output_scale(self, n_samples=1024):
+        """Set output_scale = 1/std(MLP(z)) so initial output has ~unit var.
+
+        Uses a deterministic RNG seeded off projection_seed so calibration is
+        reproducible across runs that share the seed. Drawn from the actual
+        rescaled quantum pool (not synthetic Gaussian) so calibration accounts
+        for the pool's discrete distribution (photon counts in {0, 1, 2}).
+        """
+        if self.pool.shape[0] < self.k:
+            return  # safety: can't calibrate
+        g = torch.Generator().manual_seed(self._projection_seed + 17)
+        idx = torch.randint(0, self.pool.shape[0], (n_samples * self.k,), generator=g)
+        z = self.pool[idx].view(n_samples, self.input_dim).to(dtype=next(self.mlp.parameters()).dtype)
+        out = self.mlp(z)
+        measured_std = float(out.std().item())
+        if measured_std > 1e-8:
+            self.output_scale.data.fill_(1.0 / measured_std)
+
+    @staticmethod
+    def _init_linear(lin, is_final):
+        if is_final:
+            # Xavier (uniform) for final layer: maps unit-var input -> ~unit-var output
+            nn.init.xavier_uniform_(lin.weight)
+        else:
+            # He / Kaiming for hidden layers (good for ReLU/GELU)
+            nn.init.kaiming_normal_(lin.weight, nonlinearity="relu")
+        nn.init.zeros_(lin.bias)
+
+    def _draw_and_shape(self, batch_size, shape_tail, device, dtype):
+        # Sanity: shape_tail must match the MLP's output_dim chosen at construction.
+        flat_dim = int(torch.tensor(shape_tail).prod().item())
+        if flat_dim != self.output_dim:
+            raise ValueError(
+                f"QuantumSamplerMLP was built with output_dim={self.output_dim} "
+                f"but received shape_tail={tuple(shape_tail)} (flat={flat_dim}). "
+                "img_size in the config must match the output_dim used at construction."
+            )
+
+        # Draw B*k quantum vectors and concat per image.
+        z = self._draw(batch_size * self.k, device, dtype)        # [B*k, D]
+        z = z.view(batch_size, self.input_dim)                    # [B, k*D]
+
+        # MLP -> flat image -> reshape.
+        out = self.mlp(z) * self.output_scale                     # [B, output_dim]
+        return out.view(batch_size, *shape_tail)                  # [B, C, H, W]
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -512,6 +731,7 @@ _QUANTUM_REGISTRY = {
     "multi_sample_pe": QuantumSamplerMultiSamplePE,
     "hybrid":          QuantumSamplerHybrid,
     "fourier":         QuantumSamplerFourier,
+    "mlp":             QuantumSamplerMLP,
 }
 
 
@@ -532,6 +752,11 @@ def build_noise_sampler(settings):
         quantum_fourier_freqs       : int F (fourier only, default 49)
         quantum_fourier_max_freq    : float (fourier only, default 32)
         quantum_fourier_init        : "log" | "random" (fourier only, default "log")
+        quantum_mlp_k               : int (mlp only, default 96; input_dim = k*D)
+        quantum_mlp_hidden_dim      : int (mlp only, default 512)
+        quantum_mlp_n_hidden_layers : int (mlp only, default 2)
+        quantum_mlp_activation      : "gelu"|"relu"|"silu" (mlp only, default "gelu")
+        img_size                    : (H, W, C) tuple (required for mlp; sets output_dim = H*W*C)
     """
     source = settings.get("noise_source", "gaussian")
     if source == "gaussian":
@@ -557,9 +782,17 @@ def build_noise_sampler(settings):
     }
 
     if projection in ("multi_sample", "multi_sample_pe"):
+        # patch_size: int (square) OR a 2-list/tuple (rectangular).
+        # Rectangular is needed for k values without a square divisor
+        # (e.g. patch_size=[2,4] -> k=98 on 28x28, full theoretical rank).
+        raw_ps = settings.get("quantum_patch_size", 7)
+        if isinstance(raw_ps, (list, tuple)):
+            patch_size = [int(x) for x in raw_ps]
+        else:
+            patch_size = int(raw_ps)
         kwargs = dict(
             tiling=str(settings.get("quantum_tiling", "row")),
-            patch_size=int(settings.get("quantum_patch_size", 7)),
+            patch_size=patch_size,
             **common,
         )
         if projection == "multi_sample_pe":
@@ -575,6 +808,26 @@ def build_noise_sampler(settings):
             n_frequencies=int(settings.get("quantum_fourier_freqs", 49)),
             max_freq=float(settings.get("quantum_fourier_max_freq", 32.0)),
             freq_init=str(settings.get("quantum_fourier_init", "log")),
+            **common,
+        )
+    if projection == "mlp":
+        # output_dim is derived from img_size (H, W, C); resolve_settings
+        # already populates settings["img_size"]. Failing loudly here is
+        # better than letting a shape mismatch surface later in training.
+        img_size = settings.get("img_size")
+        if img_size is None or len(img_size) != 3:
+            raise ValueError(
+                "quantum_projection='mlp' requires settings['img_size'] = (H, W, C). "
+                f"Got: {img_size!r}"
+            )
+        h, w, c = img_size
+        output_dim = int(h) * int(w) * int(c)
+        return cls(
+            output_dim=output_dim,
+            k=int(settings.get("quantum_mlp_k", 96)),
+            hidden_dim=int(settings.get("quantum_mlp_hidden_dim", 512)),
+            n_hidden_layers=int(settings.get("quantum_mlp_n_hidden_layers", 2)),
+            activation=str(settings.get("quantum_mlp_activation", "gelu")),
             **common,
         )
     return cls(**common)
